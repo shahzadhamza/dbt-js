@@ -1,0 +1,53 @@
+{
+  "name": "dbt-js",
+  "version": "0.1.0",
+  "description": "A minimalist, dbt-like SQL transformation tool for Node.js — compile SQL models, build a dependency DAG, and materialize them on any supported SQL database.",
+  "type": "module",
+  "main": "./src/api.js",
+  "exports": {
+    ".": "./src/api.js",
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "dbt-js": "bin/dbt-js.js"
+  },
+  "license": "MIT",
+  "author": "Shahzad Hamza",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shahzadhamza/dbt-js.git"
+  },
+  "homepage": "https://github.com/shahzadhamza/dbt-js.git#readme",
+  "bugs": {
+    "url": "https://github.com/shahzadhamza/dbt-js/issues"
+  },
+  "keywords": [
+    "dbt",
+    "sql",
+    "postgres",
+    "mysql",
+    "sqlite",
+    "duckdb",
+    "etl",
+    "elt",
+    "data-transformation",
+    "dag",
+    "analytics"
+  ],
+  "files": [
+    "bin",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@duckdb/node-api": "1.5.3-r.3",
+    "better-sqlite3": "~12.9.0",
+    "csv-parse": "^5.6.0",
+    "mysql2": "^3.11.0",
+    "pg": "^8.13.0"
+  }
+}
