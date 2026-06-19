@@ -1,6 +1,6 @@
 {
   "name": "dbt-js",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A minimalist, dbt-like SQL transformation tool for Node.js — compile SQL models, build a dependency DAG, and materialize them on any supported SQL database.",
   "type": "module",
   "main": "./src/api.js",
