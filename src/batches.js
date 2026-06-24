@@ -111,6 +111,15 @@ export function computeBatches({ begin, batchSize, lookback = 1, start, end, fir
   if (start && startAt >= endAt) {
     throw new Error(`--event-time-start (${fmtTz(startAt, timezone)}) must be before the end of the window (${fmtTz(endAt, timezone)})`);
   }
+  // A future (or otherwise out-of-range) `begin` clamps startAt up to or past
+  // endAt, yielding zero batches. Without this guard `compile` crashes on b[0]
+  // and `run` silently reports success while never creating the table.
+  if (startAt >= endAt) {
+    throw new Error(
+      `Microbatch window is empty: start ${fmtTz(startAt, timezone)} is not before end ${fmtTz(endAt, timezone)} — ` +
+        `check that "begin" (${fmtTz(beginAt, timezone)}) is in the past relative to now (${fmtTz(now, timezone)})`
+    );
+  }
 
   const batches = [];
   for (let t = startAt; t < endAt; t = addBatchesTz(t, batchSize, 1, timezone)) {

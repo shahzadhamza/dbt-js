@@ -5,7 +5,7 @@
 export async function connect(connection, { projectDir, readOnly = false, schema } = {}) {
   const { type = 'postgres', ...rest } = connection;
   return type === 'duckdb'
-    ? connectDuckdb(rest.path, projectDir, readOnly)
+    ? connectDuckdb(rest.path, projectDir, readOnly, rest.attach)
     : type === 'mysql'
       ? connectMysql(rest, readOnly)
       : type === 'sqlite'
@@ -104,10 +104,22 @@ function toQmarks(sql, params) {
   return { sql: out, params: ordered };
 }
 
-async function connectDuckdb(path, projectDir, readOnly = false) {
+async function connectDuckdb(path, projectDir, readOnly = false, attach = []) {
   const { DuckDBInstance, ResultReturnType } = await import('@duckdb/node-api');
   const instance = await DuckDBInstance.create(path, readOnly ? { access_mode: 'READ_ONLY' } : undefined);
   const conn = await instance.connect();
+  // Mount external databases as catalogs (referenced as "alias"."schema"."table").
+  // Attachments are read-only by default; a read-only connection (the query API)
+  // forces every attachment read-only too. DuckDB autoloads the sqlite/postgres/
+  // mysql scanner extensions on demand, so no explicit INSTALL/LOAD is needed.
+  for (const entry of attach ?? []) {
+    const readOnlyAttach = readOnly || entry.read_only !== false;
+    const opts = [];
+    if (entry.type && entry.type !== 'duckdb') opts.push(`TYPE ${entry.type}`);
+    if (readOnlyAttach) opts.push('READ_ONLY');
+    const tail = opts.length ? ` (${opts.join(', ')})` : '';
+    await conn.run(`ATTACH '${entry.path.replace(/'/g, "''")}' AS ${quoteIdent(entry.alias)}${tail}`);
+  }
   if (projectDir) {
     // resolve read_csv('data/...') etc. against the project dir, not the app's cwd
     await conn.run(`SET file_search_path = '${projectDir.replace(/'/g, "''")}'`);

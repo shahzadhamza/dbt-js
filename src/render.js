@@ -40,7 +40,10 @@ export function render(rawSql, ctx) {
         `'${ctx.name}' uses undeclared source '${src}' — add it under "sources" in dbtjs.config.json`
       );
     }
-    return `${quoteIdent(decl.schema)}.${quoteIdent(table)}`;
+    // an attached database (DuckDB ATTACH) adds a catalog qualifier:
+    // "database"."schema"."table"; without it the name stays two-part
+    const prefix = decl.database ? `${quoteIdent(decl.database)}.` : '';
+    return `${prefix}${quoteIdent(decl.schema)}.${quoteIdent(table)}`;
   });
   if (ctx.batchStart != null) {
     // only microbatch runs supply these; elsewhere the token falls through to the leftover guard

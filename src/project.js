@@ -36,6 +36,15 @@ export function loadProject(cwd = process.cwd(), { models: inlineModels } = {}) 
 
   const seen = new Set();
   for (const { name } of [...models, ...seeds]) {
+    // ref()/source() in render.js only match \w+, so a name with other
+    // characters (e.g. "my-model") loads but is unreferenceable — reject it
+    // here with a clear message instead of a misleading template error later.
+    if (!/^\w+$/.test(name)) {
+      throw new Error(
+        `Invalid node name '${name}' — model and seed names must be word characters only ` +
+          `([A-Za-z0-9_]) so they can be used in ref()/source()`
+      );
+    }
     if (seen.has(name)) throw new Error(`Duplicate node name '${name}' across models/ and seeds/`);
     seen.add(name);
   }
@@ -100,6 +109,29 @@ function parseModelConfig(name, rawSql) {
       }
       if (config.unique_key) {
         throw new Error(`Model '${name}': "unique_key" is not used by microbatch (batches replace by event_time window)`);
+      }
+    }
+  }
+  if (config.tests !== undefined) {
+    // Validate at load so compile/run/ls surface a bad spec, not just `test`.
+    if (typeof config.tests !== 'object' || Array.isArray(config.tests)) {
+      throw new Error(`Model '${name}': "tests" must be an object mapping column -> array of tests`);
+    }
+    for (const [column, specs] of Object.entries(config.tests)) {
+      if (!Array.isArray(specs)) {
+        throw new Error(`Model '${name}': tests for column '${column}' must be an array (e.g. ["not_null", "unique"])`);
+      }
+      for (const spec of specs) {
+        const ok =
+          spec === 'not_null' ||
+          spec === 'unique' ||
+          (spec && typeof spec === 'object' && Array.isArray(spec.accepted_values) && spec.accepted_values.length > 0);
+        if (!ok) {
+          throw new Error(
+            `Model '${name}': invalid test ${JSON.stringify(spec)} on column '${column}' ` +
+              `(use "not_null", "unique", or { "accepted_values": [...] } with a non-empty list)`
+          );
+        }
       }
     }
   }

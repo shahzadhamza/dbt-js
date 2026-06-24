@@ -171,5 +171,8 @@ async function debug() {
   console.log(`config:  OK (schema "${d.schema}", ${d.modelCount} models, ${d.seedCount} seeds)`);
   console.log(`target:  ${d.target}`);
   console.log(`connect: OK (${d.database}, ${d.version.split(' on ')[0]})`);
+  for (const a of d.attached ?? []) {
+    console.log(`attach:  OK (${a.alias} -> ${a.path}${a.type ? `, ${a.type}` : ''}${a.readonly ? ', read-only' : ''})`);
+  }
   return true;
 }

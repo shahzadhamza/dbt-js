@@ -164,7 +164,7 @@ export async function seed(opts = {}) {
   });
 }
 
-// → [{ name, materialized, sql }] — no DB connection needed
+// → [{ name, materialized, sql, preHookSql, postHookSql }] — no DB connection needed
 export async function compile(opts = {}) {
   const { select } = opts;
   const { cfg, nodes, order } = loadAll(opts);
@@ -231,7 +231,9 @@ export async function query(opts = {}) {
   }
 }
 
-// → { schema, modelCount, seedCount, target, database, version } — connectivity check
+// → { schema, modelCount, seedCount, target, database, version, attached }
+//   — connectivity check. `attached` lists DuckDB ATTACH catalogs (empty on
+//   other backends).
 export async function debug(opts = {}) {
   const { cfg, models, seeds, projectDir } = loadAll(opts);
   const target = ['duckdb', 'sqlite'].includes(cfg.connection.type)
@@ -245,6 +247,17 @@ export async function debug(opts = {}) {
           ? 'SELECT sqlite_version() AS version'
           : 'SELECT current_database() AS db, version() AS version'
     );
+    let attached = [];
+    if (cfg.connection.type === 'duckdb') {
+      // proves the ATTACHes actually ran, not just that config parsed
+      const res = await client.query(
+        `SELECT database_name AS alias, path, type, readonly FROM duckdb_databases()
+         WHERE database_name NOT IN ('system', 'temp') AND NOT internal AND path IS NOT NULL
+         ORDER BY database_name`
+      );
+      // exclude the main database (its path matches connection.path)
+      attached = res.rows.filter((r) => r.path !== cfg.connection.path);
+    }
     return {
       schema: cfg.schema,
       modelCount: models.length,
@@ -252,6 +265,7 @@ export async function debug(opts = {}) {
       target,
       database: rows[0].db ?? cfg.connection.path,
       version: rows[0].version,
+      attached,
     };
   });
 }
