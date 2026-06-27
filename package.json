@@ -3,13 +3,21 @@
   "version": "0.1.2",
   "description": "A minimalist, dbt-like SQL transformation tool for Node.js — compile SQL models, build a dependency DAG, and materialize them on any supported SQL database.",
   "type": "module",
-  "main": "./src/api.js",
+  "main": "./dist/dbt-js.cjs",
+  "module": "./src/api.js",
   "exports": {
-    ".": "./src/api.js",
+    ".": {
+      "import": "./src/api.js",
+      "require": "./dist/dbt-js.cjs"
+    },
     "./package.json": "./package.json"
   },
   "bin": {
     "dbt-js": "bin/dbt-js.js"
+  },
+  "scripts": {
+    "build": "esbuild src/api.js --bundle --platform=node --format=cjs --target=node20 --packages=external --outfile=dist/dbt-js.cjs",
+    "prepack": "npm run build"
   },
   "license": "MIT",
   "author": "Shahzad Hamza",
@@ -37,11 +45,15 @@
   "files": [
     "bin",
     "src",
+    "dist",
     "README.md",
     "LICENSE"
   ],
   "engines": {
     "node": ">=20"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
   },
   "dependencies": {
     "@duckdb/node-api": "1.5.3-r.3",
