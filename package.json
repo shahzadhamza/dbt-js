@@ -1,6 +1,6 @@
 {
   "name": "dbt-js",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "A minimalist, dbt-like SQL transformation tool for Node.js — compile SQL models, build a dependency DAG, and materialize them on any supported SQL database.",
   "type": "module",
   "main": "./dist/dbt-js.cjs",
