@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { basename, join } from 'node:path';
+import { CONFIG_RE } from './render.js';
 
-const CONFIG_RE = /\/\*\s*config:\s*([\s\S]*?)\*\//;
 const MATERIALIZATIONS = new Set(['view', 'table', 'incremental']);
 const STRATEGIES = new Set(['append', 'delete+insert', 'microbatch']);
 const BATCH_SIZES = new Set(['hour', 'day', 'month', 'year']);
@@ -125,11 +125,16 @@ function parseModelConfig(name, rawSql) {
         const ok =
           spec === 'not_null' ||
           spec === 'unique' ||
-          (spec && typeof spec === 'object' && Array.isArray(spec.accepted_values) && spec.accepted_values.length > 0);
+          (spec &&
+            typeof spec === 'object' &&
+            Array.isArray(spec.accepted_values) &&
+            spec.accepted_values.length > 0 &&
+            // NOT IN (..., NULL) matches nothing, so the test would always pass
+            !spec.accepted_values.includes(null));
         if (!ok) {
           throw new Error(
             `Model '${name}': invalid test ${JSON.stringify(spec)} on column '${column}' ` +
-              `(use "not_null", "unique", or { "accepted_values": [...] } with a non-empty list)`
+              `(use "not_null", "unique", or { "accepted_values": [...] } with a non-empty list, no null)`
           );
         }
       }

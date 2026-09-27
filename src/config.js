@@ -24,11 +24,42 @@ export function loadConfig(cwd = process.cwd()) {
   return validateConfig(cfg, cwd);
 }
 
+// The api's entry point: an inline `config` object, else dbtjs.config.json.
+// Inline objects are copied first because validation mutates; the copy is
+// shallow on purpose — structuredClone would throw on function values that
+// drivers accept (pg's `password` callback, `types` parsers, ...).
+export function resolveConfig(projectDir, config) {
+  if (!config) return loadConfig(projectDir);
+  const copy = { ...config };
+  if (copy.connection && typeof copy.connection === 'object') {
+    copy.connection = { ...copy.connection };
+    if (Array.isArray(copy.connection.attach)) {
+      copy.connection.attach = copy.connection.attach.map((e) =>
+        e && typeof e === 'object' ? { ...e } : e
+      );
+    }
+  }
+  return validateConfig(copy, projectDir);
+}
+
 // Shared by the file path above and inline `config` objects passed to the api.
 // Mutates and returns cfg (defaults, env interpolation, duckdb path resolution).
+// ${ENV} interpolation runs first, so every check — and the alias derived from
+// an attachment's path — sees the real values, not the placeholders.
 export function validateConfig(cfg, cwd = process.cwd()) {
   if (!cfg.connection || typeof cfg.connection !== 'object') {
     throw new Error('config must have a "connection" object');
+  }
+  for (const [key, value] of Object.entries(cfg.connection)) {
+    if (typeof value === 'string') cfg.connection[key] = interpolateEnv(value, key);
+  }
+  if (Array.isArray(cfg.connection.attach)) {
+    for (const [i, entry] of cfg.connection.attach.entries()) {
+      if (!entry || typeof entry !== 'object') continue; // validateAttach reports it
+      for (const [key, value] of Object.entries(entry)) {
+        if (typeof value === 'string') entry[key] = interpolateEnv(value, `attach[${i}].${key}`);
+      }
+    }
   }
   cfg.connection.type ??= 'postgres';
   if (!['postgres', 'duckdb', 'mysql', 'sqlite'].includes(cfg.connection.type)) {
@@ -51,17 +82,11 @@ export function validateConfig(cfg, cwd = process.cwd()) {
   if (!cfg.schema || typeof cfg.schema !== 'string') {
     throw new Error('config must have a "schema" string (target schema for models)');
   }
-  for (const [key, value] of Object.entries(cfg.connection)) {
-    if (typeof value === 'string') cfg.connection[key] = interpolateEnv(value, key);
-  }
   if (['duckdb', 'sqlite'].includes(cfg.connection.type) && cfg.connection.path !== ':memory:') {
     // anchor to the project dir so embedding apps can run from any cwd
     cfg.connection.path = resolve(cwd, cfg.connection.path);
   }
-  for (const [i, entry] of (cfg.connection.attach ?? []).entries()) {
-    for (const [key, value] of Object.entries(entry)) {
-      if (typeof value === 'string') entry[key] = interpolateEnv(value, `attach[${i}].${key}`);
-    }
+  for (const entry of cfg.connection.attach ?? []) {
     // file-based attachments anchor to the project dir like connection.path;
     // postgres/mysql paths are connection strings — leave them untouched
     if (isFileAttach(entry.type) && entry.path !== ':memory:') {
@@ -75,8 +100,8 @@ export function validateConfig(cfg, cwd = process.cwd()) {
 }
 
 // Validates connection.attach (DuckDB only). Each entry mounts an external
-// database as a catalog via ATTACH. Env interpolation and path resolution run
-// later in validateConfig, alongside the main connection.
+// database as a catalog via ATTACH. Env interpolation has already run; path
+// resolution runs later in validateConfig, alongside the main connection.
 function validateAttach(connection) {
   if (connection.type !== 'duckdb') {
     throw new Error('"attach" is only supported for duckdb connections');

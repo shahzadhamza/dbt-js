@@ -32,15 +32,21 @@ export function topoSort(nodes) {
   return order;
 }
 
+// A selection as given to the api or --select: "a,b" or ["a", "b"].
+export function selectionTokens(spec) {
+  const parts = Array.isArray(spec) ? spec : String(spec).split(',');
+  return parts.map((s) => String(s).trim()).filter(Boolean);
+}
+
 // spec: "a,b" | "+name" (name + upstream) | "name+" (name + downstream); null = everything.
 export function expandSelection(spec, nodes, order) {
-  if (!spec) return order;
+  if (!spec || (Array.isArray(spec) && !spec.length)) return order;
   const reversed = new Map([...nodes.keys()].map((k) => [k, []]));
   for (const [name, node] of nodes) {
     for (const dep of node.deps) reversed.get(dep)?.push(name);
   }
   const selected = new Set();
-  for (const token of spec.split(',').map((s) => s.trim()).filter(Boolean)) {
+  for (const token of selectionTokens(spec)) {
     const upstream = token.startsWith('+');
     const downstream = token.endsWith('+');
     const name = token.replace(/^\+/, '').replace(/\+$/, '');

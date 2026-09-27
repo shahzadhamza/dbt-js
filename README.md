@@ -2,7 +2,7 @@
 
 A minimalist dbt-like SQL transformation tool for Postgres, MySQL, SQLite, and DuckDB. Models are plain SQL `SELECT` files; dbt-js compiles them (resolving `ref()` / `source()` / `var()`), builds a dependency DAG, and executes everything inside the database in dependency order. Like dbt, it is transformation-only — it never extracts or moves data; raw data must already be in your database (or, with DuckDB, in files it can read in place).
 
-Five dependencies: `pg`, `mysql2`, `better-sqlite3`, `@duckdb/node-api`, and `csv-parse` — the database drivers are loaded lazily, so each backend only pays for its own. Plain ESM JavaScript, no build step.
+Dependencies: `csv-parse`, plus the drivers `pg`, `mysql2`, `better-sqlite3` and `@duckdb/node-api` as **optional** dependencies — installed by default, but a driver that fails to build (native modules) doesn't fail the install, and `npm install --omit=optional dbt-js pg` keeps just the one you use. Drivers are loaded lazily; a missing one gives an `npm install <driver>` hint. Plain ESM JavaScript, no build step.
 
 ## Install
 
@@ -144,12 +144,13 @@ That's the whole template language. Anything else inside `{{ }}` / `{% %}` is a 
 
 ### Materializations
 
-- **view** (default): `CREATE OR REPLACE VIEW`
+- **view** (default): `CREATE OR REPLACE VIEW`. On Postgres, which refuses to drop/rename/retype a view's columns that way, dbt-js falls back to `DROP VIEW ... CASCADE; CREATE VIEW` in one transaction.
 - **table**: transactional `DROP TABLE ... CASCADE; CREATE TABLE ... AS SELECT` (atomic to readers; CASCADE-dropped downstream views are rebuilt later in the same run — for partial runs use `--select model+`)
 - **incremental**: first run (or `--full-refresh`) builds like a table; after that only the rows your SELECT returns are applied, via a strategy:
-  - `append` — plain `INSERT INTO ... SELECT` (immutable event data)
+  - `append` — `INSERT INTO ... SELECT` (immutable event data)
   - `delete+insert` — requires `unique_key` (string or array); deletes matching keys then inserts, in one transaction (idempotent re-runs)
   - `microbatch` — splits the event-time range into aligned windows and replaces each window in its own transaction (see below)
+  - Incremental inserts name the target's columns and select them **by name** from your query, so reordering the SELECT is safe. A column the target has but the query lacks is an error; new query columns are ignored until `--full-refresh` (dbt's default `on_schema_change: ignore`).
 
 ### Hooks
 
@@ -225,7 +226,8 @@ Any model may set `"timezone"` in its config (a string IANA zone, default `"UTC"
 - For microbatch models it aligns each window to that zone's wall-clock. `{{ batch_start }}` / `{{ batch_end }}` are emitted as naive `YYYY-MM-DD HH:MM:SS` **wall-clock strings in that zone**, so they compare directly against a locally-stored `event_time` column. A `"day"` batch in `"America/New_York"` therefore spans local midnight-to-midnight, not UTC.
 - `{{ timezone }}` is available in **any** model's SQL (raw substitution — quote it yourself, e.g. `created_at at time zone '{{ timezone }}'`).
 - `begin`, `--event-time-start`, and `--event-time-end` given as naive strings are interpreted as wall-clock in the model's `timezone`; strings with an explicit `Z`/offset stay absolute.
-- DST caveat: with `batch_size: "hour"` in a DST zone the spring-forward/fall-back hour is irregular — prefer UTC for hour-grain, or day+ grain for zoned models.
+- DST: with `batch_size: "hour"` in a DST zone, the batch spanning spring-forward covers two wall-clock hours (`01:00`–`03:00`), and the fall-back batch covers the repeated hour too — every instant is still processed exactly once. In zones whose DST change skips midnight (e.g. `Asia/Beirut`), that day's batch starts at `01:00`; later days realign to midnight.
+- The window literals carry no offset, so the database compares them in its **session** time zone. With a `timestamptz` `event_time` on Postgres/DuckDB, set the session zone to the model's `timezone` (e.g. a `pre_hook` of `set time zone 'America/New_York'`), or store event times as local `timestamp`.
 
 ## Tests
 
@@ -233,7 +235,9 @@ Declared per column in the model's config. Each compiles to a query returning vi
 
 - `"not_null"` — rows where the column is NULL
 - `"unique"` — non-NULL values appearing more than once
-- `{ "accepted_values": ["a", "b"] }` — non-NULL values outside the list
+- `{ "accepted_values": ["a", "b"] }` — non-NULL values outside the list (the list may not contain `null`: `NOT IN (..., NULL)` matches nothing, so the test could never fail)
+
+A test that can't run at all (model not built, column missing) is reported as FAIL with its error; the remaining tests still run.
 
 ## Seeds
 
@@ -248,10 +252,12 @@ dbt-js test    [--select SPEC] [--vars JSON]
 dbt-js seed    [--select SPEC]
 dbt-js compile [--select SPEC] [--vars JSON]   # print compiled SQL, no DB needed
 dbt-js ls                                       # nodes in execution order
-dbt-js debug                                    # config + connectivity check
+dbt-js debug   [--vars JSON]                    # config + connectivity check
 ```
 
-`--select` accepts comma-separated names; `+name` adds everything upstream, `name+` everything downstream (e.g. `--select orders_enriched+` rebuilds it and its dependents).
+A flag the command doesn't use (e.g. `ls --select`) or a stray argument (`dbt-js run orders` — did you mean `--select orders`?) is a usage error. Exit codes: `0` success, `1` a model/test failed or a runtime error, `2` usage error.
+
+`--select` accepts comma-separated names (an unknown name is an error, for seeds too); `+name` adds everything upstream, `name+` everything downstream (e.g. `--select orders_enriched+` rebuilds it and its dependents).
 
 On failure, downstream models are skipped and reported; exit code is 1 if anything failed.
 
@@ -303,10 +309,11 @@ await run({
 });
 ```
 
-With both given, `projectDir` is optional — it then only anchors relative DuckDB paths and locates `seeds/` (file seeds remain `ref()`-able from inline models). Inline `config` goes through the same validation and `${ENV}` interpolation as the file; your object is not mutated.
+With both given, `projectDir` is optional — it then only anchors relative DuckDB paths and locates `seeds/` (file seeds remain `ref()`-able from inline models). Inline `config` goes through the same validation and `${ENV}` interpolation as the file; your object is not mutated, and function values (e.g. pg's `password` callback) pass through untouched.
 
-- `run` also takes `eventTimeStart` / `eventTimeEnd` for microbatch backfills. `test` → `{ ok, tests: [{ id, model, pass, violations, sample }] }`; `seed` → `{ ok, seeds: [...] }`; `compile` → `[{ name, materialized, sql, preHookSql, postHookSql }]` (no DB needed); `ls` → `[{ name, kind, deps }]`; `debug` → connectivity info (including `attached`, the list of DuckDB `ATTACH` catalogs — empty on other backends).
-- `query({ sql, params?, readOnly = true, projectDir?, config? })` → `{ rows, rowCount }` runs one arbitrary statement against the warehouse. It bypasses model loading, so it works on a project with zero models (handy for inspecting results from your app). Read-only by default — DuckDB opens with `READ_ONLY` access mode, Postgres sets the session read-only — pass `readOnly: false` to write.
+- `select` may be a string (`"a,b+"`) or an array of names; `vars` must be a plain object.
+- `run` also takes `eventTimeStart` / `eventTimeEnd` for microbatch backfills. `test` → `{ ok, tests: [{ id, model, pass, violations, sample, error? }] }`; `seed` → `{ ok, seeds: [...] }`; `compile` → `[{ name, materialized, sql, preHookSql, postHookSql }]` (no DB needed); `ls` → `[{ name, kind, deps }]`; `debug` → connectivity info (including `attached`, the list of DuckDB `ATTACH` catalogs — empty on other backends). Passwords in connection strings are masked in `target` and `attached[].path`.
+- `query({ sql, params?, readOnly = true, projectDir?, config? })` → `{ rows, rowCount }` runs one arbitrary statement against the warehouse. It bypasses model loading, so it works on a project with zero models (handy for inspecting results from your app). Read-only by default — DuckDB opens with `READ_ONLY` access mode, Postgres sets the session read-only and accepts exactly one statement (so the guard can't be switched off by a second statement), MySQL and SQLite reject multi-statement SQL and writes — pass `readOnly: false` to write. An in-memory (`:memory:`) database is opened writable, since it starts empty.
 - Config or project errors **throw**; model/test failures come back as `ok: false` (mirrors the CLI's exit code 1).
 - Every call opens its own connection and closes it before returning — nothing to pool.
 - **Serialize runs yourself** (a one-promise queue is enough): DuckDB allows a single writer per file, so a scheduled refresh and an HTTP-triggered run must not overlap.
@@ -333,7 +340,7 @@ With both given, `projectDir` is optional — it then only anchors relative Duck
     "sources": { "raw_orders": { "database": "raw", "schema": "main" } }
   }
   ```
-  Then `{{ source('raw_orders', 'orders') }}` resolves to `"raw"."main"."orders"`. Each entry needs a `path` (a file path for `duckdb`/`sqlite`, a connection string for `postgres`/`mysql`); optional `type` (default `"duckdb"`), `read_only`, and `alias`. `alias` defaults to the file's basename without extension (`./raw.duckdb` → `raw`) and is required for `postgres`/`mysql` connection strings. Attachments are **read-only by default** (and the `query` API forces all of them read-only) — models materialize into the main database's `schema`, never into an attached catalog. File paths anchor to the project dir; `${ENV}` interpolation works in connection strings. Non-DuckDB types autoload the matching scanner extension, which needs network access on first use.
+  Then `{{ source('raw_orders', 'orders') }}` resolves to `"raw"."main"."orders"`. Each entry needs a `path` (a file path for `duckdb`/`sqlite`, a connection string for `postgres`/`mysql`); optional `type` (default `"duckdb"`), `read_only`, and `alias`. `alias` defaults to the file's basename without extension (`./raw.duckdb` → `raw`) and is required for `postgres`/`mysql` connection strings. Attachments are **read-only by default** (and the `query` API forces all of them read-only) — models materialize into the main database's `schema`, never into an attached catalog. File paths anchor to the project dir; `${ENV}` interpolation works in connection strings, and runs before the default alias is derived (`"path": "${SALES_DB}"` with `SALES_DB=./sales.duckdb` gets alias `sales`). Non-DuckDB types autoload the matching scanner extension, which needs network access on first use.
 - One Postgres-specific change: pre-existing **materialized views** squatting on a model's name are no longer auto-dropped (relation detection now uses `information_schema`, which can't see them); you'd get a clear Postgres error at build time instead. dbt-js itself never creates materialized views.
 
 ## MySQL notes
@@ -345,7 +352,7 @@ Requires MySQL 8.0+ (`CREATE TABLE ... AS SELECT` under GTID consistency additio
 - MySQL DDL implicitly commits, so `table` and `--full-refresh` rebuilds (DROP + CREATE TABLE AS) are **not** atomic to readers the way they are on Postgres/DuckDB. `delete+insert` and microbatch window replacement remain fully transactional.
 - No `CREATE INDEX IF NOT EXISTS` — use an idempotent post-hook like `analyze table {{ this }}`, or guard index creation yourself.
 - Seed type inference maps `numeric` to `decimal(38,10)` (bare `NUMERIC` is `DECIMAL(10,0)` on MySQL and would round); `boolean` becomes `TINYINT(1)` with `true/false` loaded as `1/0`. Override per column via `seeds.columnTypes` as usual.
-- Microbatch boundaries are computed in UTC and compared as `DATETIME` literals — prefer a `DATETIME` event-time column, or set the session time zone to UTC via mysql2's `timezone` connection option.
+- Microbatch boundaries are wall-clock times in the model's `timezone` (default UTC), compared as `DATETIME` literals — prefer a `DATETIME` event-time column; a `TIMESTAMP` column is compared in the session time zone, so match it to the model's `timezone`.
 - Rows come back with `dateStrings: true` (dates as strings, JSON-safe, matching the DuckDB adapter); set `dateStrings: false` in the connection object to get JS `Date`s from the `query` API.
 
 ## SQLite notes
@@ -359,6 +366,14 @@ Driver: `better-sqlite3` (synchronous — a long-running statement blocks the em
 - Seed `boolean` columns load as `1/0` (the text `'true'` would be falsy in `CASE WHEN`); `numeric` needs no special mapping (affinity stores decimals losslessly).
 - The read-only `query` API opens the files with SQLite's readonly flag — writes fail with `SQLITE_READONLY`, and the database files must already exist.
 - INTEGER values beyond 2^53 come back as imprecise JS numbers from the `query` API.
+
+## Development
+
+```sh
+npm install
+npm test        # node:test — unit tests, SQLite/DuckDB end-to-end, stubbed Postgres
+npm run build   # CommonJS bundle in dist/
+```
 
 ## License
 

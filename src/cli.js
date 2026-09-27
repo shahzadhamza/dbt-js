@@ -20,45 +20,74 @@ Options:
   --event-time-start TS  Backfill microbatch models from this time (run only)
   --event-time-end TS    End of the backfill window (requires --event-time-start)`;
 
+// Exit codes: 0 ok, 1 model/test failure or runtime error, 2 usage error.
+// Sets process.exitCode rather than calling process.exit(), which can cut
+// off stdout still buffered for a pipe (`dbt-js compile | tee out.sql`).
 export async function main(argv = process.argv.slice(2)) {
-  let values, command;
+  process.exitCode = await dispatch(argv);
+}
+
+// Flags a command would otherwise silently ignore.
+const RUN_ONLY = ['full-refresh', 'event-time-start', 'event-time-end'];
+const UNSUPPORTED_FLAGS = {
+  test: RUN_ONLY,
+  seed: [...RUN_ONLY, 'vars'],
+  compile: RUN_ONLY,
+  ls: [...RUN_ONLY, 'select', 'vars'],
+  debug: [...RUN_ONLY, 'select'],
+};
+
+async function dispatch(argv) {
+  let values, positionals;
   try {
     const parsed = parseArgs({
       args: argv,
       allowPositionals: true,
       options: {
         select: { type: 'string' },
-        'full-refresh': { type: 'boolean', default: false },
+        'full-refresh': { type: 'boolean' },
         vars: { type: 'string' },
         'event-time-start': { type: 'string' },
         'event-time-end': { type: 'string' },
-        help: { type: 'boolean', default: false },
+        help: { type: 'boolean', short: 'h' },
       },
     });
-    values = parsed.values;
-    command = parsed.positionals[0];
+    ({ values, positionals } = parsed);
   } catch (e) {
     console.error(`Error: ${e.message}\n\n${USAGE}`);
-    process.exit(2);
+    return 2;
   }
 
-  if (!command || values.help) {
+  const [command, ...extra] = positionals;
+  if (values.help) {
     console.log(USAGE);
-    process.exit(command ? 0 : 2);
+    return 0;
   }
-
+  if (!command) {
+    console.error(USAGE);
+    return 2;
+  }
   const commands = { run, test, seed, compile, ls, debug };
-  if (!commands[command]) {
+  if (!Object.hasOwn(commands, command)) {
     console.error(`Error: unknown command '${command}'\n\n${USAGE}`);
-    process.exit(2);
+    return 2;
+  }
+  if (extra.length) {
+    // `dbt-js run orders` is almost always a forgotten --select
+    console.error(`Error: unexpected argument '${extra[0]}' (did you mean --select ${extra[0]}?)\n\n${USAGE}`);
+    return 2;
+  }
+  const unsupported = UNSUPPORTED_FLAGS[command]?.find((flag) => values[flag] !== undefined);
+  if (unsupported) {
+    console.error(`Error: --${unsupported} is not supported by '${command}'\n\n${USAGE}`);
+    return 2;
   }
 
   try {
-    const ok = await commands[command](values);
-    process.exit(ok ? 0 : 1);
+    return (await commands[command](values)) ? 0 : 1;
   } catch (e) {
     console.error(`Error: ${e.message}`);
-    process.exit(1);
+    return 1;
   }
 }
 
@@ -101,12 +130,9 @@ function printModelEvent(e) {
 }
 
 async function run(values) {
-  if (values['event-time-end'] && !values['event-time-start']) {
-    throw new Error('--event-time-end requires --event-time-start');
-  }
   const result = await api.run({
     ...baseOpts(values),
-    fullRefresh: values['full-refresh'],
+    fullRefresh: values['full-refresh'] ?? false,
     eventTimeStart: values['event-time-start'],
     eventTimeEnd: values['event-time-end'],
     onEvent: printModelEvent,
@@ -123,6 +149,8 @@ async function test(values) {
     onEvent: (e) => {
       if (e.pass) {
         console.log(`PASS ${e.id}`);
+      } else if (e.error) {
+        console.log(`FAIL ${e.id} (error: ${e.error})`);
       } else {
         console.log(`FAIL ${e.id} (${e.violations} violating rows)`);
         for (const row of e.sample) console.log(`     ${JSON.stringify(row)}`);
@@ -166,8 +194,8 @@ async function ls() {
   return true;
 }
 
-async function debug() {
-  const d = await api.debug();
+async function debug(values) {
+  const d = await api.debug(baseOpts(values));
   console.log(`config:  OK (schema "${d.schema}", ${d.modelCount} models, ${d.seedCount} seeds)`);
   console.log(`target:  ${d.target}`);
   console.log(`connect: OK (${d.database}, ${d.version.split(' on ')[0]})`);

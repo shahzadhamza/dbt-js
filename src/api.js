@@ -10,28 +10,31 @@
 //            /* config: {...} */ comment included)
 // projectDir then only anchors relative duckdb paths and locates seeds/.
 
-import { loadConfig, validateConfig } from './config.js';
+import { resolveConfig } from './config.js';
 import { loadProject } from './project.js';
-import { buildDag, expandSelection } from './dag.js';
+import { buildDag, expandSelection, selectionTokens } from './dag.js';
 import { connect, ensureSchema } from './db.js';
-import { runModel } from './materialize.js';
+import { renderCtx, runModel } from './materialize.js';
 import { buildTests, runTest } from './tests.js';
 import { loadSeed } from './seed.js';
 import { render } from './render.js';
 import { computeBatches } from './batches.js';
 
 function loadAll({ projectDir = process.cwd(), vars, config, models: inlineModels } = {}) {
-  const cfg = config
-    ? validateConfig(structuredClone(config), projectDir) // clone: validation mutates (defaults, env interp, path resolve)
-    : loadConfig(projectDir);
-  if (vars) cfg.vars = { ...cfg.vars, ...vars };
+  const cfg = resolveConfig(projectDir, config);
+  if (vars != null) {
+    if (typeof vars !== 'object' || Array.isArray(vars)) {
+      throw new Error(`vars must be a plain object, got ${JSON.stringify(vars)}`);
+    }
+    cfg.vars = { ...cfg.vars, ...vars };
+  }
   const { models, seeds } = loadProject(projectDir, { models: inlineModels });
   const { nodes, order } = buildDag(models, seeds);
   return { cfg, models, seeds, nodes, order, projectDir };
 }
 
-async function withClient(cfg, projectDir, fn) {
-  const client = await connect(cfg.connection, { projectDir, schema: cfg.schema });
+async function withClient(cfg, projectDir, fn, { readOnly = false } = {}) {
+  const client = await connect(cfg.connection, { projectDir, readOnly, schema: cfg.schema });
   try {
     return await fn(client);
   } finally {
@@ -43,7 +46,7 @@ async function withClient(cfg, projectDir, fn) {
 //     rowCount?, batchCount?, failedBatches?, durationMs?, error? }] }
 export async function run(opts = {}) {
   const { select, fullRefresh = false, eventTimeStart, eventTimeEnd, onEvent } = opts;
-  if (eventTimeEnd && !eventTimeStart) throw new Error('eventTimeEnd requires eventTimeStart');
+  if (eventTimeEnd && !eventTimeStart) throw new Error('eventTimeEnd (--event-time-end) requires eventTimeStart (--event-time-start)');
   const { cfg, nodes, order, projectDir } = loadAll(opts);
   const selected = expandSelection(select, nodes, order).filter(
     (n) => nodes.get(n).type === 'model'
@@ -75,7 +78,6 @@ export async function run(opts = {}) {
       try {
         const result = await runModel(client, node, cfg, {
           fullRefresh,
-          vars: cfg.vars,
           eventTimeStart,
           eventTimeEnd,
           onBatch: (b) => onEvent?.({ type: 'batch', model: name, ...b }),
@@ -105,7 +107,8 @@ export async function run(opts = {}) {
   });
 }
 
-// → { ok, tests: [{ id, model, pass, violations, sample }] }
+// → { ok, tests: [{ id, model, pass, violations, sample, error? }] } — a test
+//   that can't run (missing relation/column) is a failure with `error`, not a throw
 export async function test(opts = {}) {
   const { select, onEvent } = opts;
   const { cfg, nodes, order, projectDir } = loadAll(opts);
@@ -119,7 +122,12 @@ export async function test(opts = {}) {
   return withClient(cfg, projectDir, async (client) => {
     const results = [];
     for (const t of tests) {
-      const r = await runTest(client, t);
+      let r;
+      try {
+        r = await runTest(client, t);
+      } catch (e) {
+        r = { pass: false, error: e.message };
+      }
       const rec = {
         type: 'test',
         id: t.id,
@@ -127,6 +135,7 @@ export async function test(opts = {}) {
         pass: r.pass,
         violations: r.violations ?? 0,
         sample: r.sample ?? [],
+        ...(r.error && { error: r.error }),
       };
       results.push(rec);
       onEvent?.(rec);
@@ -139,8 +148,12 @@ export async function test(opts = {}) {
 export async function seed(opts = {}) {
   const { select, onEvent } = opts;
   const { cfg, seeds, projectDir } = loadAll(opts);
-  const wanted = select ? new Set(String(select).split(',').map((s) => s.trim())) : null;
-  const selected = wanted ? seeds.filter((s) => wanted.has(s.name)) : seeds;
+  const wanted = select ? selectionTokens(select) : null;
+  for (const name of wanted ?? []) {
+    // same strictness as expandSelection: a typo shouldn't silently shrink the run
+    if (!seeds.some((s) => s.name === name)) throw new Error(`--select: unknown seed '${name}'`);
+  }
+  const selected = wanted ? seeds.filter((s) => wanted.includes(s.name)) : seeds;
   if (!selected.length) throw new Error('No seeds match this selection');
 
   return withClient(cfg, projectDir, async (client) => {
@@ -185,14 +198,8 @@ export async function compile(opts = {}) {
       });
       batchCtx = { batchStart: b[0].start, batchEnd: b[b.length - 1].end };
     }
-    const ctx = {
-      name,
-      schema: cfg.schema,
-      vars: cfg.vars,
-      isIncremental: false, // compile is offline; run decides this against the live DB
-      sources: cfg.sources,
-      timezone: node.config.timezone,
-    };
+    // isIncremental stays false: compile is offline; run decides it against the live DB
+    const ctx = renderCtx(node, cfg);
     const { sql } = render(node.rawSql, { ...ctx, ...batchCtx });
     // hooks render without batch context — batch_start/batch_end are body-only
     const preHookSql = node.config.pre_hook.map((h) => render(h, ctx).sql);
@@ -220,15 +227,8 @@ export async function ls(opts = {}) {
 export async function query(opts = {}) {
   const { sql, params, readOnly = true, projectDir = process.cwd(), config } = opts;
   if (typeof sql !== 'string' || !sql.trim()) throw new Error('sql is required');
-  const cfg = config
-    ? validateConfig(structuredClone(config), projectDir)
-    : loadConfig(projectDir);
-  const client = await connect(cfg.connection, { projectDir, readOnly, schema: cfg.schema });
-  try {
-    return await client.query(sql, params);
-  } finally {
-    await client.end();
-  }
+  const cfg = resolveConfig(projectDir, config);
+  return withClient(cfg, projectDir, (client) => client.query(sql, params), { readOnly });
 }
 
 // → { schema, modelCount, seedCount, target, database, version, attached }
@@ -236,9 +236,7 @@ export async function query(opts = {}) {
 //   other backends).
 export async function debug(opts = {}) {
   const { cfg, models, seeds, projectDir } = loadAll(opts);
-  const target = ['duckdb', 'sqlite'].includes(cfg.connection.type)
-    ? `${cfg.connection.type} ${cfg.connection.path}`
-    : `${cfg.connection.host}:${cfg.connection.port}/${cfg.connection.database} as ${cfg.connection.user}`;
+  const target = describeTarget(cfg.connection);
   return withClient(cfg, projectDir, async (client) => {
     const { rows } = await client.query(
       cfg.connection.type === 'mysql'
@@ -255,8 +253,11 @@ export async function debug(opts = {}) {
          WHERE database_name NOT IN ('system', 'temp') AND NOT internal AND path IS NOT NULL
          ORDER BY database_name`
       );
-      // exclude the main database (its path matches connection.path)
-      attached = res.rows.filter((r) => r.path !== cfg.connection.path);
+      // exclude the main database (its path matches connection.path); postgres/
+      // mysql attachments' paths are connection strings, so mask credentials
+      attached = res.rows
+        .filter((r) => r.path !== cfg.connection.path)
+        .map((r) => ({ ...r, path: maskSecrets(r.path) }));
     }
     return {
       schema: cfg.schema,
@@ -268,4 +269,21 @@ export async function debug(opts = {}) {
       attached,
     };
   });
+}
+
+function describeTarget(c) {
+  if (c.type === 'duckdb' || c.type === 'sqlite') return `${c.type} ${c.path}`;
+  if (c.connectionString || c.uri) return `${c.type} ${maskSecrets(c.connectionString ?? c.uri)}`;
+  // unset fields fall back to the driver's defaults (libpq env vars for pg)
+  const port = c.port ?? (c.type === 'mysql' ? 3306 : 5432);
+  const user = c.user ? ` as ${c.user}` : '';
+  return `${c.host ?? 'localhost'}:${port}/${c.database ?? '(default)'}${user}`;
+}
+
+// Hide passwords in URL (scheme://user:pass@host) and libpq/DuckDB-style
+// key=value (password=...) connection strings.
+function maskSecrets(s) {
+  return String(s)
+    .replace(/(\/\/[^:/@\s]*:)[^@\s]*@/, '$1***@')
+    .replace(/\b(password|passwd|pwd)(\s*=\s*)('[^']*'|"[^"]*"|[^\s;]+)/gi, '$1$2***');
 }

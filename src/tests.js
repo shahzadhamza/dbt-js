@@ -23,7 +23,8 @@ export function buildTests(models, schema) {
             sql: `SELECT ${col}, count(*) AS n FROM ${target} WHERE ${col} IS NOT NULL GROUP BY ${col} HAVING count(*) > 1`,
             params: [],
           });
-        } else if (spec?.accepted_values?.length) {
+        } else {
+          // project.js validated the spec: this is { accepted_values: [...] }
           const placeholders = spec.accepted_values.map((_, i) => `$${i + 1}`).join(', ');
           tests.push({
             id: `${model.name}.${column}.accepted_values`,
@@ -31,8 +32,6 @@ export function buildTests(models, schema) {
             sql: `SELECT ${col}, count(*) AS n FROM ${target} WHERE ${col} IS NOT NULL AND ${col} NOT IN (${placeholders}) GROUP BY ${col}`,
             params: spec.accepted_values,
           });
-        } else {
-          throw new Error(`Unknown test ${JSON.stringify(spec)} on ${model.name}.${column}`);
         }
       }
     }

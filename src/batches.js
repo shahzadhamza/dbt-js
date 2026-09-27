@@ -4,38 +4,73 @@
 
 const UNITS = ['hour', 'day', 'month', 'year'];
 
+const DAY_MS = 86_400_000;
+
+// Constructing an Intl.DateTimeFormat is expensive (tens of µs) and this runs
+// several times per batch, so keep one per zone.
+const formatters = new Map();
+function formatterFor(tz) {
+  let dtf = formatters.get(tz);
+  if (!dtf) {
+    dtf = new Intl.DateTimeFormat('en-US', {
+      timeZone: tz,
+      hourCycle: 'h23',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+    });
+    formatters.set(tz, dtf);
+  }
+  return dtf;
+}
+
 // Wall-clock components of an instant as seen in `tz`: { year, month(1-12),
 // day, hour, minute, second }. Built on Intl so it tracks DST automatically.
 function partsInZone(date, tz) {
-  const dtf = new Intl.DateTimeFormat('en-US', {
-    timeZone: tz,
-    hourCycle: 'h23',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-  });
+  if (tz === 'UTC') {
+    // the default zone — plain Date getters are far cheaper than Intl
+    return {
+      year: date.getUTCFullYear(),
+      month: date.getUTCMonth() + 1,
+      day: date.getUTCDate(),
+      hour: date.getUTCHours(),
+      minute: date.getUTCMinutes(),
+      second: date.getUTCSeconds(),
+    };
+  }
   const p = {};
-  for (const part of dtf.formatToParts(date)) {
+  for (const part of formatterFor(tz).formatToParts(date)) {
     if (part.type !== 'literal') p[part.type] = Number(part.value);
   }
   if (p.hour === 24) p.hour = 0; // some engines emit 24 for midnight under h23
   return p;
 }
 
-// The UTC instant for a wall-clock time interpreted in `tz`, DST-correct via an
-// offset back-solve (one correction pass resolves spring-forward/fall-back).
+// The UTC instant for a wall-clock time interpreted in `tz`. Tries the zone's
+// offset a day before and a day after. Equal offsets mean no transition is
+// near; otherwise:
+//   - one candidate round-trips        → that instant
+//   - both round-trip (fall-back overlap) → the earlier instant
+//   - neither round-trips (spring-forward gap) → shift forward past the gap,
+//     so 02:30 on a 02:00→03:00 night becomes 03:30
 function zonedWallToUtc({ year, month, day, hour, minute, second }, tz) {
+  const naive = Date.UTC(year, month - 1, day, hour, minute, second);
   const offsetAt = (ms) => {
     const p = partsInZone(new Date(ms), tz);
     return Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second) - ms;
   };
-  const naive = Date.UTC(year, month - 1, day, hour, minute, second);
-  let utc = naive - offsetAt(naive);
-  utc = naive - offsetAt(utc);
-  return new Date(utc);
+  const before = naive - offsetAt(naive - DAY_MS);
+  const after = naive - offsetAt(naive + DAY_MS);
+  if (before === after) return new Date(before);
+  const roundTrips = (ms) => {
+    const p = partsInZone(new Date(ms), tz);
+    return Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second) === naive;
+  };
+  const hits = [before, after].filter(roundTrips);
+  return new Date(hits.length ? Math.min(...hits) : before);
 }
 
 // Parse a date string into a UTC instant. A string carrying an explicit zone
@@ -56,21 +91,26 @@ export function parseInZone(s, tz = 'UTC') {
   );
 }
 
-// Back-compat alias — parsing in UTC.
-export const parseUtc = (s) => parseInZone(s, 'UTC');
-
-function truncTz(date, size, tz) {
+// Wall-clock parts of `date` in `tz`, zeroed below `size`.
+function truncParts(date, size, tz) {
   const p = partsInZone(date, tz);
   p.second = 0;
   p.minute = 0;
   if (size !== 'hour') p.hour = 0;
   if (size === 'month' || size === 'year') p.day = 1;
   if (size === 'year') p.month = 1;
-  return zonedWallToUtc(p, tz);
+  return p;
 }
 
+function truncTz(date, size, tz) {
+  return zonedWallToUtc(truncParts(date, size, tz), tz);
+}
+
+// Steps from the *nominal* boundary: a boundary shifted by a DST gap (e.g.
+// Beirut's missing midnight → 01:00) still advances to the next 00:00
+// rather than carrying the shift into every later batch.
 function addBatchesTz(date, size, n, tz) {
-  const p = partsInZone(date, tz);
+  const p = truncParts(date, size, tz);
   if (size === 'hour') p.hour += n;
   else if (size === 'day') p.day += n;
   else if (size === 'month') p.month += n;
@@ -122,8 +162,14 @@ export function computeBatches({ begin, batchSize, lookback = 1, start, end, fir
   }
 
   const batches = [];
-  for (let t = startAt; t < endAt; t = addBatchesTz(t, batchSize, 1, timezone)) {
-    batches.push({ start: fmtTz(t, timezone), end: fmtTz(addBatchesTz(t, batchSize, 1, timezone), timezone) });
+  for (let t = startAt; t < endAt; ) {
+    const next = addBatchesTz(t, batchSize, 1, timezone);
+    // zonedWallToUtc always moves forward through gaps; this is a backstop
+    // so a timezone-data surprise fails loudly instead of looping forever
+    if (next <= t) throw new Error(`Internal error: batch boundary did not advance past ${fmtTz(t, timezone)} (${timezone})`);
+    const batchStart = batches.at(-1)?.end ?? fmtTz(t, timezone); // previous end == this start
+    batches.push({ start: batchStart, end: fmtTz(next, timezone) });
+    t = next;
   }
   return batches;
 }

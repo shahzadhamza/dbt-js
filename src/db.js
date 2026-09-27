@@ -1,6 +1,8 @@
 // All database access lives here. connect() dispatches on connection.type and
 // returns a uniform client: { query(sql, params) -> { rows, rowCount }, end() }.
 // Drivers are imported lazily so each backend only loads its own.
+import { existsSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 
 export async function connect(connection, { projectDir, readOnly = false, schema } = {}) {
   const { type = 'postgres', ...rest } = connection;
@@ -13,17 +15,56 @@ export async function connect(connection, { projectDir, readOnly = false, schema
         : connectPg(rest, readOnly);
 }
 
+// Drivers are optionalDependencies (a failed native build of one mustn't break
+// installs for users of another), so a missing one gets an actionable error.
+async function importDriver(specifier, pkg = specifier) {
+  try {
+    return await import(specifier);
+  } catch (e) {
+    const missing = ['ERR_MODULE_NOT_FOUND', 'MODULE_NOT_FOUND'].includes(e.code) && e.message.includes(pkg);
+    if (!missing) throw e;
+    throw new Error(`This connection type needs the '${pkg}' driver, which is not installed — run: npm install ${pkg}`);
+  }
+}
+
+// Runs connect-time session setup; on failure closes the handle before
+// rethrowing, so a bad ATTACH/SET doesn't leak a connection (or, for DuckDB,
+// keep the database file locked in a long-lived host process).
+async function setupOrClose(close, setup) {
+  try {
+    await setup();
+  } catch (e) {
+    try {
+      await close();
+    } catch {
+      // the setup error is the one worth reporting
+    }
+    throw e;
+  }
+}
+
 async function connectPg(connection, readOnly = false) {
-  const { default: pg } = await import('pg');
+  const { default: pg } = await importDriver('pg');
   const client = new pg.Client(connection);
   await client.connect();
   // Session-level read-only also applies inside data-modifying CTEs,
   // which a statement-keyword check can't catch.
-  if (readOnly) await client.query('SET default_transaction_read_only = on');
+  await setupOrClose(
+    () => client.end(),
+    async () => {
+      if (readOnly) await client.query('SET default_transaction_read_only = on');
+    }
+  );
   return {
     dialect: 'postgres',
     async query(sql, params) {
-      const res = await client.query(sql, params);
+      // Read-only: force the extended protocol, which accepts exactly one
+      // statement — otherwise "SET default_transaction_read_only = off; DROP ..."
+      // would run as a multi-statement simple query and undo the guard.
+      const res = await client.query(
+        readOnly ? { text: sql, values: params, queryMode: 'extended' } : sql,
+        readOnly ? undefined : params
+      );
       return { rows: res.rows, rowCount: res.rowCount ?? undefined };
     },
     end: () => client.end(),
@@ -31,7 +72,7 @@ async function connectPg(connection, readOnly = false) {
 }
 
 async function connectMysql(connection, readOnly = false) {
-  const { default: mysql } = await import('mysql2/promise');
+  const { default: mysql } = await importDriver('mysql2/promise', 'mysql2');
   const conn = await mysql.createConnection({
     dateStrings: true, // JSON-safe rows, matching the duckdb adapter
     ...connection,
@@ -39,8 +80,13 @@ async function connectMysql(connection, readOnly = false) {
   });
   // render.js emits "schema"."name" with no dialect knowledge; ANSI_QUOTES
   // makes double-quoted identifiers valid for the whole session.
-  await conn.query(`SET SESSION sql_mode = CONCAT_WS(',', NULLIF(@@sql_mode, ''), 'ANSI_QUOTES')`);
-  if (readOnly) await conn.query('SET SESSION transaction_read_only = 1');
+  await setupOrClose(
+    () => conn.end(),
+    async () => {
+      await conn.query(`SET SESSION sql_mode = CONCAT_WS(',', NULLIF(@@sql_mode, ''), 'ANSI_QUOTES')`);
+      if (readOnly) await conn.query('SET SESSION transaction_read_only = 1');
+    }
+  );
   return {
     dialect: 'mysql',
     async query(sql, params) {
@@ -57,20 +103,23 @@ async function connectMysql(connection, readOnly = false) {
 async function connectSqlite(connection, schema, readOnly = false) {
   // Synchronous driver; long statements block the event loop (fine for CLI use,
   // worth knowing when embedding).
-  const { default: Database } = await import('better-sqlite3');
-  const db = new Database(connection.path, readOnly ? { readonly: true } : {});
+  const { default: Database } = await importDriver('better-sqlite3');
+  // an in-memory database can't be opened readonly (and starts empty, so
+  // there's nothing to protect)
+  const db = new Database(connection.path, readOnly && connection.path !== ':memory:' ? { readonly: true } : {});
   // cfg.schema 'main'/'temp' are SQLite's built-in schemas (single-file mode).
   // Anything else lives in '<schema>.db' beside the main file, ATTACHed for the
   // whole session so "schema"."name" from render.js resolves. ATTACH inherits
   // the connection's readonly flag and can't create files read-only, so a
   // missing file is skipped there (queries then fail with "no such table").
   if (schema && schema !== 'main' && schema !== 'temp') {
-    const { join, dirname } = await import('node:path');
-    const { existsSync } = await import('node:fs');
     const path =
       connection.path === ':memory:' ? ':memory:' : join(dirname(connection.path), `${schema}.db`);
     if (!readOnly || path === ':memory:' || existsSync(path)) {
-      db.prepare(`ATTACH DATABASE ? AS ${quoteIdent(schema)}`).run(path);
+      await setupOrClose(
+        () => db.close(),
+        async () => db.prepare(`ATTACH DATABASE ? AS ${quoteIdent(schema)}`).run(path)
+      );
     }
   }
   return {
@@ -105,25 +154,36 @@ function toQmarks(sql, params) {
 }
 
 async function connectDuckdb(path, projectDir, readOnly = false, attach = []) {
-  const { DuckDBInstance, ResultReturnType } = await import('@duckdb/node-api');
-  const instance = await DuckDBInstance.create(path, readOnly ? { access_mode: 'READ_ONLY' } : undefined);
+  const { DuckDBInstance, ResultReturnType } = await importDriver('@duckdb/node-api');
+  // as with SQLite, an in-memory database can't be opened READ_ONLY; its
+  // attachments below are still forced read-only
+  const instance = await DuckDBInstance.create(
+    path,
+    readOnly && path !== ':memory:' ? { access_mode: 'READ_ONLY' } : undefined
+  );
   const conn = await instance.connect();
   // Mount external databases as catalogs (referenced as "alias"."schema"."table").
   // Attachments are read-only by default; a read-only connection (the query API)
   // forces every attachment read-only too. DuckDB autoloads the sqlite/postgres/
   // mysql scanner extensions on demand, so no explicit INSTALL/LOAD is needed.
-  for (const entry of attach ?? []) {
-    const readOnlyAttach = readOnly || entry.read_only !== false;
-    const opts = [];
-    if (entry.type && entry.type !== 'duckdb') opts.push(`TYPE ${entry.type}`);
-    if (readOnlyAttach) opts.push('READ_ONLY');
-    const tail = opts.length ? ` (${opts.join(', ')})` : '';
-    await conn.run(`ATTACH '${entry.path.replace(/'/g, "''")}' AS ${quoteIdent(entry.alias)}${tail}`);
-  }
-  if (projectDir) {
-    // resolve read_csv('data/...') etc. against the project dir, not the app's cwd
-    await conn.run(`SET file_search_path = '${projectDir.replace(/'/g, "''")}'`);
-  }
+  const close = () => {
+    conn.disconnectSync();
+    instance.closeSync(); // checkpoints WAL, releases the file lock
+  };
+  await setupOrClose(close, async () => {
+    for (const entry of attach ?? []) {
+      const readOnlyAttach = readOnly || entry.read_only !== false;
+      const opts = [];
+      if (entry.type && entry.type !== 'duckdb') opts.push(`TYPE ${entry.type}`);
+      if (readOnlyAttach) opts.push('READ_ONLY');
+      const tail = opts.length ? ` (${opts.join(', ')})` : '';
+      await conn.run(`ATTACH ${quoteLiteral(entry.path)} AS ${quoteIdent(entry.alias)}${tail}`);
+    }
+    if (projectDir) {
+      // resolve read_csv('data/...') etc. against the project dir, not the app's cwd
+      await conn.run(`SET file_search_path = ${quoteLiteral(projectDir)}`);
+    }
+  });
   return {
     dialect: 'duckdb',
     async query(sql, params) {
@@ -137,14 +197,12 @@ async function connectDuckdb(path, projectDir, readOnly = false, attach = []) {
         : undefined; // DDL/CTAS: DuckDB doesn't report counts
       return { rows, rowCount };
     },
-    async end() {
-      conn.disconnectSync();
-      instance.closeSync(); // checkpoints WAL, releases the file lock
-    },
+    end: async () => close(),
   };
 }
 
 export const quoteIdent = (s) => `"${String(s).replace(/"/g, '""')}"`;
+export const quoteLiteral = (s) => `'${String(s).replace(/'/g, "''")}'`;
 export const rel = (schema, name) => `${quoteIdent(schema)}.${quoteIdent(name)}`;
 
 export async function ensureSchema(client, schema) {
@@ -188,7 +246,34 @@ export async function withTransaction(client, fn) {
     await client.query('COMMIT');
     return result;
   } catch (e) {
-    await client.query('ROLLBACK');
+    try {
+      await client.query('ROLLBACK');
+    } catch {
+      // e.g. MySQL after an implicit commit, or a dropped connection — the
+      // statement error is the one worth reporting
+    }
     throw e;
   }
+}
+
+// Target column names in table order — lets inserts name their columns, so a
+// model whose SELECT reorders columns can't silently shift data into the wrong
+// ones. Same catalog/case handling as relationKind above.
+export async function relationColumns(client, schema, name) {
+  if (client.dialect === 'sqlite') {
+    const { rows } = await client.query(
+      'SELECT name FROM pragma_table_info($1, $2) ORDER BY cid',
+      [name, schema]
+    );
+    return rows.map((r) => r.name);
+  }
+  const catalogPredicate =
+    client.dialect === 'mysql' ? '' : 'table_catalog = current_database() AND ';
+  const { rows } = await client.query(
+    `SELECT column_name AS column_name FROM information_schema.columns
+     WHERE ${catalogPredicate}table_schema = $1 AND table_name = $2
+     ORDER BY ordinal_position`,
+    [schema, name]
+  );
+  return rows.map((r) => r.column_name);
 }
